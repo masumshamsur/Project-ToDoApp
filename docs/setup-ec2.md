@@ -1,6 +1,10 @@
-# Set up the EC2 instances
+# Set up the web servers (EC2)
 
-You launch two identical instances, one in each public subnet, and run the app on port `3000` as a systemd service.
+You launch two identical instances, one in each public subnet, connect them to the RDS database from [setup-rds.md](setup-rds.md), and run the app on port `3000` as a systemd service.
+
+Before you start, have the RDS **endpoint** and **master password** ready. See [setup-rds.md → Check the database](setup-rds.md#3-check-the-database).
+
+If something doesn't match, see [troubleshooting.md](troubleshooting.md).
 
 ## 1. Create the IAM role
 
@@ -26,44 +30,46 @@ In the **EC2** console, choose **Launch instances** and create the first instanc
 | Name | `web-server-1` |
 | AMI | Amazon Linux 2023 (64-bit x86) |
 | Instance type | `t3.micro` |
-| Key pair | **Create new key pair**: RSA, `.pem` |
-| VPC | `TodoAppVPC` |
-| Subnet | `TodoApp-Subnet-Public-A` |
-| Auto-assign public IP | Enable |
-| Security group | `ToDoApp-Webserver-SG` |
+| Key pair | `web-server-1` (or **Create new key pair**: RSA, `.pem`) |
+| Network settings → **Edit** | VPC `TodoAppVPC`, subnet `TodoApp-Subnet-Public-A`, auto-assign public IP **Enable** |
+| Firewall | **Select existing security group** → `ToDoApp-Webserver-SG` |
+| Storage | Default 8 GiB gp3 |
 | IAM instance profile (under **Advanced details**) | `TodoApp-EC2-Role` |
 
-Repeat for `web-server-2` in `TodoApp-Subnet-Public-B`.
+Repeat for `web-server-2` with key pair `web-server-2` and subnet `TodoApp-Subnet-Public-B`.
 
-Wait until both show **Running** and **3/3 checks passed**. (`Bastion-connect` in this screenshot is a leftover from an earlier attempt and was terminated. This architecture doesn't need a bastion, because the web servers are in public subnets with SSH limited to your IP.)
+Wait until both show **Running** and **3/3 checks passed**, one in each Availability Zone:
 
-![EC2 instances list with web-server-1 in us-east-1a and web-server-2 in us-east-1b](images/20-ec2-instances-list.png)
+![EC2 instances list: web-server-1 in us-east-1a and web-server-2 in us-east-1b, both Running with 3/3 checks passed](images/r2-08-ec2-instances-list.png)
 
 ### Check each instance
 
-**web-server-1**: `TodoAppVPC`, `TodoApp-Subnet-Public-A`, private IP `10.0.1.123`, with a public IP.
+| Instance | ID | Subnet | AZ | Private IP |
+|---|---|---|---|---|
+| `web-server-1` | `i-0ef1c46433f0f1a11` | `TodoApp-Subnet-Public-A` (`10.0.1.0/24`) | `us-east-1a` | `10.0.1.75` |
+| `web-server-2` | `i-04939ffcb52cbe2c3` | `TodoApp-Subnet-Public-B` (`10.0.2.0/24`) | `us-east-1b` | `10.0.2.181` |
 
-![web-server-1 Networking tab: TodoAppVPC, Public-A, us-east-1a](images/21-ec2-ws1-networking.png)
+On the **Details** tab, check the VPC, the subnet, the IAM role `TodoApp-EC2-Role`, and that the instance has a public IPv4 address. Because DNS hostnames are on in the VPC, each instance also gets a public DNS name (`ec2-…compute-1.amazonaws.com`).
 
-**Security** tab: IAM role `TodoApp-EC2-Role`, security group `ToDoApp-Webserver-SG`.
+**web-server-1**: `TodoApp-Subnet-Public-A`, private IP `10.0.1.75`.
 
-![web-server-1 Security tab: TodoApp-EC2-Role and ToDoApp-Webserver-SG](images/22-ec2-ws1-security.png)
+![web-server-1 Details tab: TodoAppVPC, TodoApp-Subnet-Public-A, private IP 10.0.1.75, IAM role TodoApp-EC2-Role, AL2023 AMI](images/r2-09-ec2-ws1-details.png)
 
-**Details** tab: Amazon Linux 2023 AMI, plus the key pair name you need for SSH.
+**web-server-2**: `TodoApp-Subnet-Public-B`, private IP `10.0.2.181`.
 
-![web-server-1 Details tab: AL2023 AMI and key pair web-server-1](images/23-ec2-ws1-details.png)
+![web-server-2 Details tab: TodoAppVPC, TodoApp-Subnet-Public-B, private IP 10.0.2.181, IAM role TodoApp-EC2-Role, AL2023 AMI](images/r2-10-ec2-ws2-details.png)
 
-**web-server-2**: `TodoApp-Subnet-Public-B` (`us-east-1b`), private IP `10.0.3.137`, same role and security group.
+On the **Security** tab, check the IAM role and the security group `ToDoApp-Webserver-SG`, with TCP `3000` from the ALB's security group and SSH `22` from your IP only.
 
-![web-server-2 Details tab: AL2023 AMI and key pair web-server-2](images/24-ec2-ws2-details.png)
+![web-server-1 Security tab: TodoApp-EC2-Role, ToDoApp-Webserver-SG with 3000 from the ALB security group and 22 from my IP](images/r2-11-ec2-ws1-security.png)
 
-![web-server-2 Security tab: TodoApp-EC2-Role and ToDoApp-Webserver-SG](images/25-ec2-ws2-security.png)
+**web-server-2** uses the same role and security group:
 
-![web-server-2 Networking tab: TodoAppVPC, Public-B, us-east-1b](images/26-ec2-ws2-networking.png)
+![web-server-2 Security tab: TodoApp-EC2-Role, ToDoApp-Webserver-SG with the same inbound rules](images/r2-15-ec2-ws2-security.png)
 
-## 3. Install and configure the app
+## 3. Install and run the app
 
-Do steps 3.1–3.4 and 3.6–3.7 on **both** instances. Do step 3.5 on **one** instance only, because both share the same database.
+Do all of these steps on **both** instances.
 
 ### 3.1 Connect
 
@@ -72,11 +78,12 @@ chmod 400 ~/.ssh/web-server-1.pem
 ssh -i ~/.ssh/web-server-1.pem ec2-user@<instance-public-ip>
 ```
 
-The prompt changes to `[ec2-user@ip-10-0-x-x ~]$`. The "post-quantum key exchange" warning and the "newer release of Amazon Linux" message are harmless.
+Use `web-server-2.pem` for `web-server-2`. The prompt changes to `[ec2-user@ip-10-0-x-x ~]$`. The "post-quantum key exchange" warning and the "newer release of Amazon Linux" message are harmless.
 
-![SSH login to web-server-2](images/29-ec2-ws2-ssh-login.png)
+- `Permission denied (publickey)`: the key file permissions are too open, or you used the other server's key. See [troubleshooting.md → SSH: Permission denied (publickey)](troubleshooting.md#ssh-permission-denied-publickey).
+- `Operation timed out`: your public IP has probably changed. See [troubleshooting.md → SSH: Operation timed out](troubleshooting.md#ssh-operation-timed-out).
 
-If SSH times out, your public IP has probably changed. See [troubleshooting.md → SSH: Operation timed out](troubleshooting.md#ssh-operation-timed-out). Or use **Connect → Session Manager → Connect**, then run `sudo su - ec2-user`.
+Either way, you can also use **Connect → Session Manager → Connect**, then run `sudo su - ec2-user`.
 
 ### 3.2 Install Node.js and tools
 
@@ -91,17 +98,22 @@ node -v
 git clone https://github.com/masumshamsur/Project-ToDoApp.git ~/todo-app
 cd ~/todo-app
 npm install --omit=dev
+ls
 ```
 
-The app code lives in its own public repo, [masumshamsur/Project-ToDoApp](https://github.com/masumshamsur/Project-ToDoApp), so the clone holds just this project at the top level. `.env` is git-ignored, so the database password never goes to GitHub. You create `.env` on each instance in the next step.
+The app code lives in its own public repo, [masumshamsur/Project-ToDoApp](https://github.com/masumshamsur/Project-ToDoApp), so the clone holds just this project at the top level. `.env` is git-ignored, so the database password never goes to GitHub.
+
+![Project-ToDoApp repo on GitHub: db, docs, public, .env.example, .gitignore, README.md, index.js, package.json, package-lock.json](images/r2-07-github-repo.png)
+
+There's no `todo-app` folder in the repo. The last argument of `git clone` names the folder to create on the instance, so `~/todo-app` (`/home/ec2-user/todo-app`) ends up holding the repo's files. Without that argument, git would name the folder after the repo (`~/Project-ToDoApp`). Use `~/todo-app`, because the systemd service (`WorkingDirectory`), the `.env` path and the update commands all expect it.
 
 ### 3.4 Create `.env`
 
 ```bash
 cat > ~/todo-app/.env <<'EOF'
-DB_HOST=todo-instance-lab5.xxxxxxxx.us-east-1.rds.amazonaws.com
+DB_HOST=todo-db-instance.<id>.us-east-1.rds.amazonaws.com
 DB_USER=admin
-DB_PASSWORD=CHANGE_ME
+DB_PASSWORD=change-me
 DB_NAME=todo_app
 API_BASE_URL=http://localhost:3000
 EOF
@@ -109,9 +121,14 @@ chmod 600 ~/todo-app/.env
 nano ~/todo-app/.env
 ```
 
-Replace `CHANGE_ME` with the RDS master password in nano, so it doesn't end up in your shell history. Set `API_BASE_URL` to the ALB URL later, in [setup-alb.md](setup-alb.md).
+- Set `DB_HOST` to your RDS endpoint (in this build, `todo-db-instance.cmz0eoi66au7.us-east-1.rds.amazonaws.com`).
+- In nano, replace `change-me` with the RDS master password. Typing it in the editor keeps it out of your shell history. Save with **Ctrl+O**, **Enter**, then exit with **Ctrl+X**.
 
-Test the connection. This uses the app's own `mysql2` driver, so you don't need a MySQL client:
+`chmod 600` makes the file readable only by `ec2-user`. `API_BASE_URL` stays `http://localhost:3000` for now. You change it to the load balancer's address in [setup-alb.md](setup-alb.md#3-point-the-app-at-the-alb).
+
+### 3.5 Test the database connection (both instances)
+
+This uses the app's own `mysql2` driver, so you don't need a MySQL client:
 
 ```bash
 cd ~/todo-app
@@ -132,11 +149,20 @@ require('mysql2/promise').createConnection({
 | `CONNECTED { version: '8.4.x', tls_required: 0 }` | Ready |
 | `CONNECTED ... tls_required: 1` | RDS requires TLS. See [troubleshooting.md](troubleshooting.md#rds-requires-tls) |
 | `FAILED ETIMEDOUT` | `ToDoApp-Database-SG` doesn't allow `3306` from `ToDoApp-Webserver-SG`, or the DB is in another VPC |
+| `FAILED ENOTFOUND` | `DB_HOST` is wrong, or still the `<id>` placeholder |
 | `FAILED ER_ACCESS_DENIED_ERROR` | Wrong user or password in `.env` |
 
-![Database connection test on web-server-1: MySQL 8.4.11, TLS not required](images/27-ec2-ws1-db-connection-test.png)
+To check `.env` without showing the password, run `grep -v PASSWORD ~/todo-app/.env`. Both servers connect to MySQL `8.4.11`, and TLS isn't required:
 
-### 3.5 Create the schema (one instance only)
+![web-server-1: .env checked with grep -v PASSWORD, then the connection test prints CONNECTED version 8.4.11, tls_required 0](images/r2-17-rds-connection-test-ws1.png)
+
+![web-server-2: the same check and connection test, CONNECTED version 8.4.11](images/r2-18-rds-connection-test-ws2.png)
+
+### 3.6 Create the schema (one instance only)
+
+Both instances share the same database, so run this on **one** of them:
+
+> **Don't skip this step.** The connection test above passes even when the table doesn't exist, but `/tasks` then fails with `Could not fetch tasks`. See [troubleshooting.md](troubleshooting.md#tasks-returns-could-not-fetch-tasks-run-2).
 
 ```bash
 cd ~/todo-app
@@ -161,9 +187,18 @@ require('mysql2/promise').createConnection({
 "
 ```
 
-This is the same SQL as [db/schema.sql](../db/schema.sql). If that file is in your clone, you can load it with any MySQL client instead.
+It should print `TABLE READY: id, task_name, task_description, due_date, completed, created_at`. This is the same SQL as [db/schema.sql](../db/schema.sql). It creates the `Tasks` table that `index.js` queries:
 
-### 3.6 Run the app as a systemd service
+| Column | Type | Notes |
+|---|---|---|
+| `id` | `INT AUTO_INCREMENT` | Primary key |
+| `task_name` | `VARCHAR(255)` | Required |
+| `task_description` | `TEXT` | Optional |
+| `due_date` | `DATE` | Optional |
+| `completed` | `TINYINT(1)` | `0` or `1`, default `0` |
+| `created_at` | `TIMESTAMP` | Set automatically |
+
+### 3.7 Run the app as a systemd service
 
 ```bash
 NODE_BIN=$(which node)
@@ -186,24 +221,46 @@ sudo systemctl enable --now todo-app
 sudo systemctl status todo-app --no-pager
 ```
 
-### 3.7 Test on the instance
+`enable` starts the app automatically when the instance boots, and `Restart=always` restarts it if it crashes.
+
+### 3.8 Test on the instance
+
+**The app is running.** On both instances:
+
+```bash
+curl -s -o /dev/null -w 'Homepage HTTP %{http_code}\n' localhost:3000/
+curl -s localhost:3000/config; echo
+```
+
+Expect `Homepage HTTP 200` and `{"API_BASE_URL":"http://localhost:3000"}`.
+
+**web-server-1:** the service is `active (running)` (the log shows `Server running on port 3000`), and both tests pass.
+
+![web-server-1: todo-app service active (running), Homepage HTTP 200 and the /config response](images/r2-14-ec2-ws1-service-and-tests.png)
+
+**web-server-2:** the same.
+
+![web-server-2: todo-app service active (running), Homepage HTTP 200 and the /config response](images/r2-12-ec2-ws2-service-and-tests.png)
+
+**The app reads and writes the database.** Run this on web-server-1 first, then on web-server-2, changing the task name:
 
 ```bash
 curl -s localhost:3000/tasks; echo
 curl -s -X POST localhost:3000/tasks -H 'Content-Type: application/json' \
-  -d '{"taskName":"Test from web-server-1","dueDate":"2026-10-31"}'; echo
-curl -s -o /dev/null -w 'Homepage HTTP %{http_code}\n' localhost:3000/
+  -d '{"taskName":"Test from web-server-1","dueDate":"2026-12-31"}'; echo
 ```
 
-Expect a JSON list, `Task created successfully`, and `Homepage HTTP 200`.
+Expect a JSON list and `Task created successfully`. If you get `Could not fetch tasks`, the table is missing. Run [3.6](#36-create-the-schema-one-instance-only).
 
-**web-server-1**: the service is `active (running)`, the list starts empty (`[]`), task 1 is created, and the homepage returns 200.
+**web-server-1:** after `TABLE READY`, the list starts empty (`[]`) and task 1 is created.
 
-![web-server-1: todo-app service running and API tests passing](images/28-ec2-ws1-service-and-tests.png)
+![web-server-1: TABLE READY with all six columns, GET /tasks returns [], POST creates taskId 1](images/r2-22-schema-and-tasks-ws1.png)
 
-**web-server-2**: the first `GET /tasks` already returns "Test from web-server-1", which proves both servers share the same RDS database. Its own task becomes task 2.
+**web-server-2:** the first `GET /tasks` already returns "Test from web-server-1", which proves both servers share the same RDS database. Its own task becomes task 2. The log lines above it are from an earlier attempt, before the table existed.
 
-![web-server-2: service running, sees task 1 from web-server-1, creates task 2](images/30-ec2-ws2-service-and-tests.png)
+![web-server-2: GET /tasks lists task 1 from web-server-1, POST creates taskId 2](images/r2-23-tasks-ws2-shared-db.png)
+
+> **Changed `.env`?** The app reads `.env` only at startup, so run `sudo systemctl restart todo-app` after editing it.
 
 ## Viewing logs
 
@@ -223,4 +280,4 @@ Run this on both instances.
 
 ## Next step
 
-[Set up the RDS database](setup-rds.md).
+[Create the Application Load Balancer](setup-alb.md).

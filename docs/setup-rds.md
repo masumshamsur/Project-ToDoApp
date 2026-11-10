@@ -1,6 +1,8 @@
 # Set up the RDS MySQL database
 
-The database runs in the private subnets and accepts connections only from the web server security group.
+The database runs in the private subnets and accepts connections only from the web server security group. You create it before the web servers, so its endpoint is ready when you configure the app.
+
+You can't connect to the database from your computer, because it's private. The connection test and the schema are done from the web servers in [setup-ec2.md](setup-ec2.md#35-test-the-database-connection-both-instances).
 
 If something doesn't match, see [troubleshooting.md](troubleshooting.md).
 
@@ -9,13 +11,14 @@ If something doesn't match, see [troubleshooting.md](troubleshooting.md).
 1. Open the **Aurora and RDS** console and go to **Subnet groups → Create DB subnet group**.
 2. Fill in:
    - **Name:** `todoapp-db-subnet-group`
+   - **Description:** `Private subnets for TodoApp RDS`
    - **VPC:** `TodoAppVPC`
    - **Availability Zones:** `us-east-1a` and `us-east-1b`
-   - **Subnets:** `10.0.2.0/24` (Private-A) and `10.0.4.0/24` (Private-B), the private subnets only
+   - **Subnets:** `10.0.3.0/24` (`TodoApp-Subnet-Private-A`) and `10.0.4.0/24` (`TodoApp-Subnet-Private-B`), the private subnets only
 
 The subnet group should list only the two private subnets:
 
-![DB subnet group containing only TodoApp-Subnet-Private-A and Private-B](images/18-rds-subnet-group-fixed.png)
+![todoapp-db-subnet-group in TodoAppVPC with only TodoApp-Subnet-Private-A (10.0.3.0/24, us-east-1a) and TodoApp-Subnet-Private-B (10.0.4.0/24, us-east-1b)](images/r2-19-rds-subnet-group.png)
 
 > **Don't use the auto-created `default-vpc-...` group.** If you skip this step, the RDS console creates a `default-vpc-<id>` subnet group containing **every** subnet in the VPC, public ones included. See [troubleshooting.md → RDS subnet group includes public subnets](troubleshooting.md#rds-subnet-group-includes-public-subnets).
 
@@ -28,7 +31,7 @@ The subnet group should list only the two private subnets:
    |---|---|
    | Engine | MySQL (default version, 8.4.x; avoid 8.0, which is past standard support and costs extra) |
    | Template | Free tier (or Sandbox / Dev/Test) |
-   | DB instance identifier | `todo-instance-lab5` |
+   | DB instance identifier | `todo-db-instance` |
    | Master username | `admin` |
    | Credentials management | **Self managed**. Set a strong password and save it |
    | Instance class | `db.t4g.micro` (or `db.t3.micro`) |
@@ -44,44 +47,39 @@ The subnet group should list only the two private subnets:
 
 3. Choose **Create database** and wait for the status to become **Available** (about 5–10 minutes).
 
-![Databases list showing todo-instance-lab5 in the TodoAppVPC, Multi-AZ No](images/15-rds-databases-list.png)
-
 ## 3. Check the database
 
-Open the database and go to **Connectivity & security**. Copy the endpoint from the **Connection steps** snippet (`todo-instance-lab5.<id>.us-east-1.rds.amazonaws.com`). This is your `DB_HOST`. **Internet access gateway** should be **Disabled**.
+Open the database and go to **Connectivity & security**. The redesigned console has no separate **Endpoint** field. The endpoint is inside the second **Connection steps** snippet, right after `mysql -h`:
 
-![RDS Connectivity and security tab showing the endpoint in the connection snippet](images/13-rds-connectivity.png)
+```
+mysql -h todo-db-instance.cmz0eoi66au7.us-east-1.rds.amazonaws.com -P 3306 -u admin -p ...
+         └──────────────────── endpoint = DB_HOST ────────────────┘
+```
 
-Scroll down to **Security group rules**. The only inbound rule should allow the web server security group.
+Copy only the host name, from `todo-db-instance` to `.amazonaws.com`. Don't copy `mysql -h` or the options after it. The port is `3306`. **Internet access gateway** should be **Disabled**, which confirms the database isn't reachable from the internet. Save the endpoint: it becomes `DB_HOST` in the app's `.env`.
 
-![RDS security group rules: inbound from ToDoApp-Webserver-SG only](images/14-rds-sg-rules.png)
+![RDS Connectivity and security tab: status Available, us-east-1a, internet access gateway Disabled, and the endpoint inside the mysql -h connection snippet](images/r2-16-rds-connectivity.png)
 
-> **Console layout:** the redesigned RDS console no longer has a **Networking** section on this tab. Find the subnet group under **Subnet groups** in the sidebar, and the engine version on the **Configuration** tab. See [troubleshooting.md → Can't find the RDS networking details](troubleshooting.md#cant-find-the-rds-networking-details).
+You can also choose **Endpoints** under **Connect using** to see the endpoint on its own, or run this from any machine with the AWS CLI:
+
+```bash
+aws rds describe-db-instances --db-instance-identifier todo-db-instance \
+  --query 'DBInstances[0].Endpoint.Address' --output text
+```
+
+Further down, under **Security group rules**, the only inbound rule should allow `ToDoApp-Webserver-SG` on port `3306`. The web servers don't exist yet, but the rule refers to their security group, so it already lets them in once they're launched. In the redesigned console you can also check it under **VPC → Security groups → `ToDoApp-Database-SG` → Inbound rules**.
 
 To confirm the database is private and see which subnet it's in, resolve its endpoint from any machine. It should return a **private** `10.0.x.x` address:
 
 ```bash
-dig +short todo-instance-lab5.<id>.us-east-1.rds.amazonaws.com @8.8.8.8
-# 10.0.2.246  -> TodoApp-Subnet-Private-A (10.0.2.0/24), not publicly accessible
+dig +short todo-db-instance.<id>.us-east-1.rds.amazonaws.com @8.8.8.8
+# 10.0.3.x  -> TodoApp-Subnet-Private-A (10.0.3.0/24), not publicly accessible
 ```
 
 > **Multi-AZ:** for production, enable **Multi-AZ DB instance**, so a standby in the second private subnet takes over if the primary fails. It roughly doubles the cost, so it's optional for this lab.
 
-## 4. Create the schema
-
-You can't reach the database from your computer, because it's in a private subnet. Create the schema from one of the web servers. See [setup-ec2.md → 3.5 Create the schema](setup-ec2.md#35-create-the-schema-one-instance-only). It uses the app's own `mysql2` driver, so you don't need a MySQL client.
-
-[db/schema.sql](../db/schema.sql) creates the `Tasks` table that `index.js` queries:
-
-| Column | Type | Notes |
-|---|---|---|
-| `id` | `INT AUTO_INCREMENT` | Primary key |
-| `task_name` | `VARCHAR(255)` | Required |
-| `task_description` | `TEXT` | Optional |
-| `due_date` | `DATE` | Optional |
-| `completed` | `TINYINT(1)` | `0` or `1`, default `0` |
-| `created_at` | `TIMESTAMP` | Set automatically |
-
 ## Next step
 
-[Create the Application Load Balancer](setup-alb.md).
+Keep the endpoint and the master password handy. You put them in `.env` on the web servers in the next step.
+
+[Launch the web servers (EC2)](setup-ec2.md).

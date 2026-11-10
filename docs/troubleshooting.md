@@ -1,6 +1,23 @@
 # Troubleshooting
 
-Problems we hit while deploying this project, and how each was fixed. Problems that come up often but didn't happen here are listed at the end.
+Problems we hit while deploying this project, and how each was fixed. The project was built twice:
+
+- **Run 1** was the first build. Its subnet CIDRs didn't match the diagram.
+- **Run 2** is the rebuild that matches the diagram, documented in the order network → database → web servers → load balancer.
+
+Entries marked **(Run 2)** come from the rebuild. The others come from Run 1 and still apply if you make the same mistake, so they're kept. Problems that come up often but didn't happen here are listed at the end.
+
+## Run 2 at a glance
+
+| Step | Problem | Cause | Fix |
+|---|---|---|---|
+| 1 · Network | [SSH rule on the wrong security group](#ssh-rule-on-the-wrong-security-group-run-2) | SSH from My IP was added to `ToDoApp-ALB-SG`, and the web server group allowed SSH from `0.0.0.0/0` | Deleted the ALB SSH rule. Set the web server SSH source to **My IP** |
+| 3 · Web servers | [SSH: Permission denied (publickey)](#ssh-permission-denied-publickey) | Key file permissions too open | `chmod 400` on the `.pem` key |
+| 2 · Database | Couldn't find the RDS endpoint | The new console shows it only inside the connection snippet | See [setup-rds.md → Check the database](setup-rds.md#3-check-the-database) |
+| 3 · Web servers | [`/tasks` returns "Could not fetch tasks"](#tasks-returns-could-not-fetch-tasks-run-2) | `ER_NO_SUCH_TABLE`: the schema step was skipped | Ran the schema script on one server |
+| 4 · Load balancer | [Register targets lists no instances](#register-targets-lists-no-instances-run-2) | The list hadn't loaded | Refreshed the page. Both servers appeared |
+| 4 · Load balancer | [ALB "Reachability may be impacted"](#alb-reachability-may-be-impacted-no-outbound-rule-run-2) | `ToDoApp-ALB-SG` had **0 outbound rules**, so the ALB couldn't reach the targets | Added outbound TCP `3000` → `ToDoApp-Webserver-SG` |
+| 4 · Load balancer | [Due dates show one day early](#due-dates-show-one-day-early) | App bug: a UTC date is shown in local time | Known issue, one-line fix in `public/script.js` |
 
 **Contents**
 
@@ -8,20 +25,25 @@ Problems we hit while deploying this project, and how each was fixed. Problems t
   - [Subnet CIDRs don't match the diagram](#subnet-cidrs-dont-match-the-diagram)
   - [Web server security group open to the internet](#web-server-security-group-open-to-the-internet)
   - [SSH rule on the wrong security group (Run 2)](#ssh-rule-on-the-wrong-security-group-run-2)
+  - [SSH: Permission denied (publickey)](#ssh-permission-denied-publickey)
   - [SSH: Operation timed out](#ssh-operation-timed-out)
 - Database
   - [Can't find the RDS networking details](#cant-find-the-rds-networking-details)
   - [RDS subnet group includes public subnets](#rds-subnet-group-includes-public-subnets)
   - [Schema file and MySQL client not on the instance](#schema-file-and-mysql-client-not-on-the-instance)
   - [RDS requires TLS](#rds-requires-tls)
+  - [`/tasks` returns "Could not fetch tasks" (Run 2)](#tasks-returns-could-not-fetch-tasks-run-2)
 - EC2
   - [Instance launched without the IAM role](#instance-launched-without-the-iam-role)
   - [Extra instance not in the architecture](#extra-instance-not-in-the-architecture)
   - [Harmless messages in the terminal](#harmless-messages-in-the-terminal)
 - Load balancer and app
+  - [ALB "Reachability may be impacted": no outbound rule (Run 2)](#alb-reachability-may-be-impacted-no-outbound-rule-run-2)
+  - [Register targets lists no instances (Run 2)](#register-targets-lists-no-instances-run-2)
   - [Target group shows targets as Unused](#target-group-shows-targets-as-unused)
   - [Page loads but the list is empty and Add Task does nothing](#page-loads-but-the-list-is-empty-and-add-task-does-nothing)
   - [`curl /config` prints nothing after a restart](#curl-config-prints-nothing-after-a-restart)
+  - [Due dates show one day early](#due-dates-show-one-day-early)
 - [Other common problems](#other-common-problems)
 - [Useful diagnostic commands](#useful-diagnostic-commands)
 
@@ -35,7 +57,9 @@ Problems we hit while deploying this project, and how each was fixed. Problems t
 
 **Cause:** the CIDRs were typed in a different order when the subnets were created.
 
-**Fix:** none needed. A subnet is public or private because of its **route table**, not its CIDR. The docs use the deployed values. If you want to match the diagram exactly, delete and recreate the two subnets **before** putting anything in them. You can't change a subnet's CIDR after it's created.
+**Status:** fixed in Run 2. The subnets were recreated with the diagram's CIDRs (Public-A `10.0.1.0/24`, Public-B `10.0.2.0/24`, Private-A `10.0.3.0/24`, Private-B `10.0.4.0/24`). See [setup-network.md](setup-network.md#1-create-the-vpc-and-subnets).
+
+**Why it didn't break anything in Run 1:** a subnet is public or private because of its **route table**, not its CIDR. If you want to match the diagram exactly, delete and recreate the two subnets **before** putting anything in them. You can't change a subnet's CIDR after it's created.
 
 ![Subnets list showing the deployed CIDRs](images/04-subnets.png)
 
@@ -90,6 +114,25 @@ After the fix, `ToDoApp-ALB-SG` has only HTTP `80`, and `ToDoApp-Webserver-SG` a
 ![ToDoApp-Webserver-SG after the fix: TCP 3000 from the ALB security group, SSH 22 from my IP](images/r2-06-sg-webserver.png)
 
 **Rule of thumb:** SSH goes only on the group attached to the instances you log in to, and only from **My IP**.
+
+### SSH: Permission denied (publickey)
+
+**Symptom:** in Run 2, the first SSH attempt to `web-server-2` failed:
+
+```
+ec2-user@<public-ip>: Permission denied (publickey,gssapi-keyex,gssapi-with-mic).
+```
+
+**Cause:** SSH refuses a private key file that other users can read. A freshly downloaded `.pem` file usually has permissions that are too open. Other causes of the same message are using the wrong key (for example `web-server-1.pem` on `web-server-2`) or the wrong user name. On Amazon Linux the user is `ec2-user`.
+
+**Fix:** make the key readable only by you, then connect again with the key pair that the instance was launched with (shown on its **Details** tab as **Key pair assigned at launch**):
+
+```bash
+chmod 400 ~/.ssh/web-server-2.pem
+ssh -i ~/.ssh/web-server-2.pem ec2-user@<public-ip>
+```
+
+![First SSH attempt fails with Permission denied (publickey). After chmod 400 on the key, the connection succeeds](images/r2-13-ssh-permission-denied.png)
 
 ### SSH: Operation timed out
 
@@ -148,7 +191,7 @@ You can also check whether the database is public, and which subnet it's in, by 
 dig +short <db-endpoint> @8.8.8.8
 ```
 
-A `10.0.x.x` address means it isn't publicly accessible. The third number shows the subnet: `10.0.2.x` is Private-A.
+A `10.0.x.x` address means it isn't publicly accessible. The third number shows the subnet: in the Run 2 layout, `10.0.3.x` is Private-A and `10.0.4.x` is Private-B. In Run 2 the database is in us-east-1a, so Private-A.
 
 ### RDS subnet group includes public subnets
 
@@ -157,6 +200,8 @@ A `10.0.x.x` address means it isn't publicly accessible. The third number shows 
 ![default-vpc subnet group with all four subnets, including the public ones](images/17-rds-subnet-group-before.png)
 
 **Cause:** when you create a database without choosing a subnet group, the console auto-creates one with **every** subnet in the VPC. RDS can then put the DB, or a future standby or restore, in a public subnet.
+
+This happened in Run 1, so the CIDRs below are the Run 1 layout, where the private subnets were `10.0.2.0/24` and `10.0.4.0/24`. In Run 2, the custom subnet group `todoapp-db-subnet-group` was created first, with only `10.0.3.0/24` and `10.0.4.0/24`. See [setup-rds.md](setup-rds.md).
 
 **Check where the DB actually is:** `dig +short <db-endpoint> @8.8.8.8` returned `10.0.2.246`, so it's in Private-A. That makes it safe to edit the group.
 
@@ -170,9 +215,46 @@ If the DB is already **in** a public subnet, you can't remove that subnet from i
 
 **Symptom:** `db/schema.sql` or `.env.example` is missing after `git clone`, or `mysql` reports `command not found`.
 
-**Cause:** the GitHub repo has only the app code (`index.js`, `public/`, `package.json`). The schema and docs were written locally and haven't been pushed. Amazon Linux 2023 doesn't include a MySQL client. Its `mariadb105` package can also fail against MySQL 8.4 users that use `caching_sha2_password`.
+**Cause (Run 1):** the GitHub repo had only the app code (`index.js`, `public/`, `package.json`). The schema and docs were written locally and hadn't been pushed. In Run 2 the app comes from [masumshamsur/Project-ToDoApp](https://github.com/masumshamsur/Project-ToDoApp), which includes `db/schema.sql` and `.env.example`. Amazon Linux 2023 doesn't include a MySQL client. Its `mariadb105` package can also fail against MySQL 8.4 users that use `caching_sha2_password`.
 
-**Fix:** create the schema with the app's own `mysql2` driver. See [setup-ec2.md → 3.5](setup-ec2.md#35-create-the-schema-one-instance-only). Create `.env` with the heredoc in [setup-ec2.md → 3.4](setup-ec2.md#34-create-env).
+**Fix:** create the schema with the app's own `mysql2` driver. See [setup-ec2.md → 3.6](setup-ec2.md#36-create-the-schema-one-instance-only). Create `.env` with the heredoc in [setup-ec2.md → 3.4](setup-ec2.md#34-create-env).
+
+### `/tasks` returns "Could not fetch tasks" (Run 2)
+
+**Symptom:** after filling in `.env` and restarting the app, the database connection test passed (`CONNECTED { version: '8.4.11' }`), but the API failed on both servers:
+
+```
+$ curl -s localhost:3000/tasks
+{"error":"Could not fetch tasks"}
+$ curl -s -X POST localhost:3000/tasks ...
+{"error":"Could not create task"}
+```
+
+![web-server-1: connection test passes, but GET and POST /tasks return Could not fetch tasks and Could not create task](images/r2-20-tasks-error-ws1.png)
+
+![web-server-2: the same errors](images/r2-21-tasks-error-ws2.png)
+
+**Diagnosis:** the app returns only a generic message to the client and logs the real error. Read the log:
+
+```bash
+sudo journalctl -u todo-app -n 20 --no-pager
+```
+
+```
+Error creating task: Error: Table 'todo_app.Tasks' doesn't exist
+  code: 'ER_NO_SUCH_TABLE',
+  errno: 1146,
+  sql: 'INSERT INTO Tasks (task_name, task_description, due_date) VALUES (?, ?, ?)',
+  sqlMessage: "Table 'todo_app.Tasks' doesn't exist"
+```
+
+**Cause:** the table-creation step ([setup-ec2.md → 3.6](setup-ec2.md#36-create-the-schema-one-instance-only)) was skipped. The connection test only logs in to MySQL and doesn't touch any table, so it passes even when the table is missing. The `todo_app` database itself existed, because it was set as the initial database name when creating RDS. Otherwise the error would be `ER_BAD_DB_ERROR` (`Unknown database 'todo_app'`).
+
+**Fix:** run the schema script from 4.3 on **one** server. It creates the database if needed and the `Tasks` table. You don't need to restart the app, because it queries the database on every request.
+
+After the fix, `GET /tasks` returns `[]`, then the test task is created:
+
+![After creating the table: TABLE READY, GET /tasks returns [], POST creates taskId 1](images/r2-22-schema-and-tasks-ws1.png)
 
 ### RDS requires TLS
 
@@ -230,17 +312,64 @@ Session Manager can take up to 30 minutes to recognise the new role. To speed it
 
 ## Load balancer and app
 
+### ALB "Reachability may be impacted": no outbound rule (Run 2)
+
+**Symptom:** right after `TodoApp-ALB` was created, a **⚠ Reachability may be impacted** warning appeared next to its name. The tooltip says "Misconfigured security group rules. View the Security tab."
+
+![TodoApp-ALB while Provisioning, with the Reachability may be impacted tooltip pointing to misconfigured security group rules](images/r2-24-alb-reachability-warning.png)
+
+The **Security** tab shows the cause. `ToDoApp-ALB-SG` has **1** inbound rule but **0 outbound rules**: "Your security groups must include at least 1 inbound rule and at least 1 outbound rule for your load balancer to receive internet traffic and send traffic to targets."
+
+![TodoApp-ALB Security tab: ToDoApp-ALB-SG with 1 inbound permission entry and 0 outbound permission entries](images/r2-25-alb-sg-no-outbound.png)
+
+**Cause:** the ALB group's default outbound rule ("All traffic → `0.0.0.0/0`") had been deleted, probably while removing the stray SSH rule in Step 1.
+
+The inbound side was fine, so browsers could still reach the ALB. But the ALB **starts its own connections** to the web servers on port `3000`, both to forward each request and to run health checks. Outbound rules control connections a resource starts, so all of these were blocked. Left like this, both targets would turn **Unhealthy**, and the browser would get **502 Bad Gateway** or **504 Gateway Timeout**.
+
+**Fix:** **EC2 → Security Groups → `ToDoApp-ALB-SG` → Outbound rules → Edit outbound rules → Add rule**:
+
+| Type | Port | Destination type | Destination |
+|---|---|---|---|
+| Custom TCP | `3000` | **Custom** | `ToDoApp-Webserver-SG` (`sg-0d06e3270610cb1c5`) |
+
+Choose **Save rules**.
+
+![Edit outbound rules on ToDoApp-ALB-SG: Custom TCP 3000 to sg-0d06e3270610cb1c5 (ToDoApp-Webserver-SG)](images/r2-26-alb-sg-outbound-fix.png)
+
+At first the destination was left as **Anywhere-IPv4** (`0.0.0.0/0`). That works, but the console warns about it, and it lets the ALB send to any address on port 3000. Pointing the rule at `ToDoApp-Webserver-SG` mirrors the web servers' inbound rule (3000 from `ToDoApp-ALB-SG`), so the ALB can reach only the web servers. See [setup-network.md → How the rules fit together](setup-network.md#how-the-rules-fit-together).
+
+After saving, the warning disappears once the ALB is **Active**, and the targets turn **Healthy**.
+
+**Rule of thumb:** security groups are stateful, so you only allow the side that **starts** a connection. Replies are always allowed back. The ALB starts connections to the targets, so its group needs an **outbound** rule to them, and the web servers' group needs the matching **inbound** rule.
+
+### Register targets lists no instances (Run 2)
+
+**Symptom:** while registering targets for `TodoApp-TG`, **Available instances** showed **(0)** and "No instances", although both web servers were running.
+
+![Register targets for TodoApp-TG: Available instances (0), No instances](images/r2-38-register-targets-empty.png)
+
+**Cause in Run 2:** the list just hadn't loaded. The target group was already in `TodoAppVPC` and both instances were running.
+
+**Fix:** refresh. Reloading the page, or using the refresh button ↻ on the **Available instances** panel, listed both servers. They were then registered on port `3000`.
+
+**If refreshing doesn't help:** this list only shows **running** instances in the **same VPC as the target group**, in the current Region. Check, in this order:
+
+1. **Target groups → TodoApp-TG → Details → VPC** must be `TodoAppVPC` (`vpc-03e97957918aae723`). The VPC dropdown in **Create target group** defaults to the **default VPC**, and a target group's VPC can't be changed later. If it's wrong, delete the target group and create it again with **VPC → `TodoAppVPC`**.
+2. Both instances must be **Running**. Stopped instances aren't listed.
+3. The console Region must be **N. Virginia** (`us-east-1`).
+
 ### Target group shows targets as Unused
 
 **Symptom:** right after you create `TodoApp-TG`, both targets show **Unused** ("Target group is not configured to receive traffic from the load balancer").
 
 **Fix:** none needed. Health checks only start once a load balancer listener forwards to the target group. Create the ALB, and within about 30 seconds of it becoming **Active** both targets turn **Healthy**.
 
-![TodoApp-TG with both targets Unused before the ALB exists](images/31-target-group.png)
+![TodoApp-TG with both targets Unused before the ALB exists](images/r2-37-tg-registered-unused.png)
 
 If targets become **Unhealthy** after the ALB exists:
 
 - `ToDoApp-Webserver-SG` must allow TCP **3000** from `ToDoApp-ALB-SG`.
+- `ToDoApp-ALB-SG` must have an outbound rule to TCP **3000** (see [above](#alb-reachability-may-be-impacted-no-outbound-rule-run-2)).
 - The app must be running: `sudo systemctl status todo-app`.
 - The target port must be **3000**, and the health check path `/` must return 200: `curl -s -o /dev/null -w '%{http_code}\n' localhost:3000/`.
 
@@ -281,6 +410,28 @@ Then hard-refresh the browser (**Cmd+Shift+R**).
 
 **Fix:** wait a moment first: `sleep 2; curl -s localhost:3000/config`.
 
+### Due dates show one day early
+
+**Symptom:** a task created with due date `2026-12-31` shows as **12/30/2026** in the browser.
+
+![The app listing Test from web-server-1 and Test from web-server-2 with due date 12/30/2026, although both were created with 2026-12-31](images/r2-30-app-via-alb.png)
+
+**Cause:** an app bug, not an infrastructure problem. The database stores the right date.
+
+1. The `due_date` column is a MySQL `DATE`, with no time or time zone.
+2. The `mysql2` driver turns it into a JavaScript `Date` at **midnight UTC**, so the API returns `"due_date":"2026-12-31T00:00:00.000Z"`.
+3. `public/script.js` formats it with `new Date(task.due_date).toLocaleDateString()`, which converts to the browser's local time. In US Eastern (UTC-5) that's **7 PM on Dec 30**.
+
+**Fix (optional, in the app code):** format the date in UTC. In `public/script.js`:
+
+```js
+const formattedDate = task.due_date
+  ? new Date(task.due_date).toLocaleDateString(undefined, { timeZone: 'UTC' })
+  : 'No due date';
+```
+
+Commit it, then run `cd ~/todo-app && git pull` on both servers and hard-refresh the browser. No restart is needed, because `script.js` is a static file. This build left it unfixed, as a known issue.
+
 ---
 
 ## Other common problems
@@ -288,7 +439,7 @@ Then hard-refresh the browser (**Cmd+Shift+R**).
 | Symptom | Cause / fix |
 |---|---|
 | `GET /tasks` returns `500` | The app can't reach the DB. Check `.env`, and that `ToDoApp-Database-SG` allows `3306` from `ToDoApp-Webserver-SG`. Run `journalctl -u todo-app -n 30 --no-pager`. |
-| `ER_NO_SUCH_TABLE` in the logs | The schema hasn't been created, or `DB_NAME` doesn't match. Run [setup-ec2.md → 3.5](setup-ec2.md#35-create-the-schema-one-instance-only). |
+| `ER_NO_SUCH_TABLE` in the logs | The schema hasn't been created, or `DB_NAME` doesn't match. Run [setup-ec2.md → 3.6](setup-ec2.md#36-create-the-schema-one-instance-only). |
 | `ER_ACCESS_DENIED_ERROR` | Wrong `DB_USER` or `DB_PASSWORD`. To reset the password: RDS → **Modify → New master password → Apply immediately**. |
 | `ETIMEDOUT` connecting to RDS | Security group rule missing, or the DB is in a different VPC. |
 | ALB returns `502` / `503` | No healthy targets. See [Target group shows targets as Unused](#target-group-shows-targets-as-unused). |

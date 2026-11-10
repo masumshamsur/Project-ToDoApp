@@ -29,12 +29,16 @@ The Node.js (Express) app runs on **two EC2 instances** in separate Availability
 
 Each tier accepts traffic only from the tier in front of it.
 
-| Security group | Inbound rule | Source |
-|---|---|---|
-| `ToDoApp-ALB-SG` | HTTP `80` | `0.0.0.0/0` |
-| `ToDoApp-Webserver-SG` | TCP `3000` | `ToDoApp-ALB-SG` |
-| `ToDoApp-Webserver-SG` | SSH `22` | My IP (`x.x.x.x/32`) |
-| `ToDoApp-Database-SG` | MySQL `3306` | `ToDoApp-Webserver-SG` |
+| Security group | Direction | Rule | Source / destination |
+|---|---|---|---|
+| `ToDoApp-ALB-SG` | Inbound | HTTP `80` | `0.0.0.0/0` |
+| `ToDoApp-ALB-SG` | Outbound | TCP `3000` | `ToDoApp-Webserver-SG` |
+| `ToDoApp-Webserver-SG` | Inbound | TCP `3000` | `ToDoApp-ALB-SG` |
+| `ToDoApp-Webserver-SG` | Inbound | SSH `22` | My IP (`x.x.x.x/32`) |
+| `ToDoApp-Webserver-SG` | Outbound | All traffic | `0.0.0.0/0` (RDS, package installs, Session Manager) |
+| `ToDoApp-Database-SG` | Inbound | MySQL `3306` | `ToDoApp-Webserver-SG` |
+
+Why each rule exists, inbound and outbound, is explained in [docs/setup-network.md → How the rules fit together](docs/setup-network.md#how-the-rules-fit-together).
 
 You can reach the instances over SSH from your own IP only, or through **Session Manager** using the instances' IAM role (`AmazonSSMManagedInstanceCore`), which needs no open port.
 
@@ -50,11 +54,13 @@ You can reach the instances over SSH from your own IP only, or through **Session
 └── docs/
     ├── architecture.png
     ├── setup-network.md  # VPC, subnets, route tables, security groups
-    ├── setup-rds.md      # RDS MySQL instance + schema
-    ├── setup-ec2.md      # IAM role, EC2 instances, running the app
+    ├── setup-rds.md      # DB subnet group, RDS MySQL instance
+    ├── setup-ec2.md      # IAM role, EC2 instances, .env, schema, running the app
     ├── setup-alb.md      # Target group, ALB, testing failover
+    ├── teardown.md       # Deleting every lab resource, in order
     ├── troubleshooting.md  # Every issue hit during deployment + fixes
-    ├── deployment-progress.md  # Checklist + IDs of the resources created
+    ├── deployment-progress.md  # Deployment report: IDs, test results, issues, cost
+    ├── run-1/            # Archived docs from the first build
     └── images/           # Console and terminal screenshots used in the guides
 ```
 
@@ -92,22 +98,24 @@ The app reads these environment variables from `.env` (see [.env.example](.env.e
 - An AWS account with permissions for VPC, EC2, RDS, ELB and IAM
 - This repository on GitHub, which the EC2 instances clone: [masumshamsur/Project-ToDoApp](https://github.com/masumshamsur/Project-ToDoApp)
 
+Build in this order: network, database, web servers, then load balancer. The results are in the [deployment report](docs/deployment-progress.md).
+
 ### 1. Create the network
 
 For the full walkthrough, see [docs/setup-network.md](docs/setup-network.md).
 
-1. Create the VPC `10.0.0.0/16` with two public and two private subnets across two AZs (CIDRs in the table above).
+1. Create the VPC `10.0.0.0/16` with two public and two private subnets across two AZs (CIDRs in the table above). Enable DNS hostnames, and auto-assign public IPv4 on the public subnets.
 2. Attach an Internet Gateway, then route `0.0.0.0/0` to it from the public route table.
 3. Leave the private route table with only the local route.
-4. Create the three security groups shown above.
+4. Create the three security groups shown above, including the ALB group's outbound rule.
 
 ### 2. Create the RDS database
 
 For the full walkthrough, see [docs/setup-rds.md](docs/setup-rds.md).
 
-1. Create a DB subnet group with both private subnets.
+1. Create a DB subnet group with **only** the two private subnets.
 2. Create a **MySQL** instance in that subnet group with `ToDoApp-Database-SG` and **Public access: No**.
-3. Copy the endpoint. You create the schema from an EC2 instance in step 3.
+3. Copy the endpoint and keep the master password. You can't connect from your computer, because the database is private. The web servers connect to it in the next step.
 
 ### 3. Launch the EC2 instances
 
@@ -115,19 +123,20 @@ For the full walkthrough, including the exact commands and the systemd service, 
 
 1. Create an IAM role for EC2 with `AmazonSSMManagedInstanceCore`.
 2. Launch two Amazon Linux 2023 instances, one in each public subnet, with `ToDoApp-Webserver-SG` and the IAM role.
-3. On each instance, install Node.js, clone the repo, create `.env` and run the app as a systemd service.
+3. On each instance, install Node.js, clone the repo to `~/todo-app`, and create `.env` with the RDS endpoint and password. Then test the database connection.
 4. From one instance, create the `todo_app` database and `Tasks` table ([db/schema.sql](db/schema.sql)). The guide does this with a short Node.js script that uses the app's `mysql2` driver, so no MySQL client is needed.
+5. Run the app as a systemd service on both instances, and test `/tasks`.
 
 ### 4. Create the Application Load Balancer
 
 For the full walkthrough, see [docs/setup-alb.md](docs/setup-alb.md).
 
-1. Create a target group (instances, HTTP `3000`, health check path `/`) and register both instances.
-2. Create an internet-facing ALB in both public subnets with `ToDoApp-ALB-SG` and a listener on HTTP `80` that forwards to the target group.
+1. Create a target group (instances, HTTP `3000`, health check path `/`, VPC `TodoAppVPC`) and register both instances.
+2. Create an internet-facing ALB in both public subnets with `ToDoApp-ALB-SG` and a listener on HTTP `80` that forwards to the target group. If it shows **Reachability may be impacted**, the ALB group is missing its outbound rule.
 3. Set `API_BASE_URL=http://<alb-dns-name>` in `.env` on both instances and restart the service.
-4. Open `http://<alb-dns-name>` in a browser.
+4. Open `http://<alb-dns-name>` in a browser, then test failover by stopping the app on one instance.
 
-![TodoApp-ALB active with its DNS name and HTTP:80 listener](docs/images/33-alb-active.png)
+![TodoApp-ALB active in both public subnets, with its DNS name and HTTP:80 listener](docs/images/r2-27-alb-active.png)
 
 ### Run locally
 
@@ -161,11 +170,12 @@ The app runs at http://localhost:3000.
 | Page loads but the list is empty and the console shows requests to `localhost:3000` | `API_BASE_URL` isn't set on the instance. Set it to the ALB URL and restart the service. |
 | `GET /tasks` returns `500` | The app can't reach the database. Check `.env`, and confirm `ToDoApp-Database-SG` allows `3306` from `ToDoApp-Webserver-SG`. Run `journalctl -u todo-app` for the error. |
 | `ER_NO_SUCH_TABLE` in logs | `db/schema.sql` hasn't been loaded, or `DB_NAME` doesn't match. |
-| ALB returns `502` / `503`, or targets are **unhealthy** | The app isn't running on port `3000`, or `ToDoApp-Webserver-SG` doesn't allow `3000` from `ToDoApp-ALB-SG`. |
+| ALB returns `502` / `503`, or targets are **unhealthy** | The app isn't running on port `3000`, `ToDoApp-Webserver-SG` doesn't allow `3000` from `ToDoApp-ALB-SG`, or `ToDoApp-ALB-SG` has no outbound rule to `3000`. |
+| ALB shows **Reachability may be impacted** | `ToDoApp-ALB-SG` is missing an inbound or outbound rule. Add outbound TCP `3000` → `ToDoApp-Webserver-SG`. |
 | ALB URL times out | `ToDoApp-ALB-SG` is missing inbound HTTP `80`, or the ALB isn't in the public subnets. |
 | SSH times out | Your public IP changed. Edit the SSH rule in `ToDoApp-Webserver-SG` and select **My IP** again. |
 | Instance doesn't show up in Session Manager | The IAM role is missing `AmazonSSMManagedInstanceCore`, or the instance has no public IP. |
 
 ## Clean up
 
-Delete resources in this order to avoid dependency errors and ongoing charges: ALB → target group → EC2 instances → RDS instance (skip the final snapshot if you don't need it) → DB subnet group → security groups → VPC.
+Delete resources in this order to avoid dependency errors and ongoing charges: ALB → target group → EC2 instances → RDS instance (skip the final snapshot if you don't need it) → DB subnet group → security groups → VPC. The ALB and web server security groups reference each other, so delete the ALB group's outbound rule first. For the console steps for each resource, see [docs/teardown.md](docs/teardown.md).
